@@ -16,6 +16,7 @@
 package okio
 
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * A source and a sink that are attached. The sink's output is the source's input. Typically each
@@ -37,6 +38,7 @@ class Pipe(internal val maxBufferSize: Long) {
   internal val buffer = Buffer()
   internal var sinkClosed = false
   internal var sourceClosed = false
+  internal var foldedSink: Sink? = null
 
   init {
     require(maxBufferSize >= 1L) { "maxBufferSize < 1: $maxBufferSize" }
@@ -48,10 +50,16 @@ class Pipe(internal val maxBufferSize: Long) {
 
     override fun write(source: Buffer, byteCount: Long) {
       var byteCount = byteCount
+      var delegate: Sink? = null
       synchronized(buffer) {
         check(!sinkClosed) { "closed" }
 
         while (byteCount > 0) {
+          foldedSink?.let {
+            delegate = it
+            return@synchronized
+          }
+
           if (sourceClosed) throw IOException("source is closed")
 
           val bufferSpaceAvailable = maxBufferSize - buffer.size
@@ -66,25 +74,81 @@ class Pipe(internal val maxBufferSize: Long) {
           (buffer as Object).notifyAll() // Notify the source that it can resume reading.
         }
       }
+
+      delegate?.let { honorsTimeoutAndDeadline(it) { write(source, byteCount) } }
     }
 
     override fun flush() {
+      var delegate: Sink? = null
       synchronized(buffer) {
         check(!sinkClosed) { "closed" }
-        if (sourceClosed && buffer.size > 0L) throw IOException("source is closed")
+
+        foldedSink?.let {
+          delegate = it
+          return@synchronized
+        }
+
+        if (sourceClosed && buffer.size > 0L) {
+          throw IOException("source is closed")
+        }
       }
+
+      delegate?.let { honorsTimeoutAndDeadline(it) { flush() } }
     }
 
     override fun close() {
+      var delegate: Sink? = null
       synchronized(buffer) {
         if (sinkClosed) return
+
+        foldedSink?.let {
+          delegate = it
+          return@synchronized
+        }
+
         if (sourceClosed && buffer.size > 0L) throw IOException("source is closed")
         sinkClosed = true
         (buffer as Object).notifyAll() // Notify the source that no more bytes are coming.
       }
+
+      delegate?.let { honorsTimeoutAndDeadline(it) { close() } }
     }
 
     override fun timeout(): Timeout = timeout
+
+    private fun honorsTimeoutAndDeadline(delegateSink: Sink, block: Sink.() -> Unit) {
+      val sinkTimeoutNanos = this.timeout().timeoutNanos()
+      val delegateOriginalTimeoutNanos = delegateSink.timeout().timeoutNanos()
+      val minTimeoutNanos = when {
+        sinkTimeoutNanos == 0L -> delegateOriginalTimeoutNanos
+        delegateOriginalTimeoutNanos == 0L -> sinkTimeoutNanos
+        sinkTimeoutNanos < delegateOriginalTimeoutNanos -> sinkTimeoutNanos
+        else -> delegateOriginalTimeoutNanos
+      }
+
+      val sinkDeadline =
+        if (this.timeout().hasDeadline()) this.timeout().deadlineNanoTime() else null
+      val delegateOriginalDeadline =
+        if (delegateSink.timeout().hasDeadline()) delegateSink.timeout().deadlineNanoTime() else null
+      val minDeadline = when {
+        sinkDeadline != null && delegateOriginalDeadline != null ->
+          if (sinkDeadline < delegateOriginalDeadline) sinkDeadline
+          else delegateOriginalDeadline
+        sinkDeadline == null -> delegateOriginalDeadline
+        else -> sinkDeadline
+      }
+
+      delegateSink.timeout().timeout(minTimeoutNanos, TimeUnit.NANOSECONDS)
+      minDeadline?.let { delegateSink.timeout().deadlineNanoTime(it) }
+
+      try {
+        delegateSink.block()
+      } finally {
+        delegateSink.timeout().timeout(delegateOriginalTimeoutNanos, TimeUnit.NANOSECONDS)
+        if (delegateOriginalDeadline == null) delegateSink.timeout().clearDeadline()
+        else delegateSink.timeout().deadlineNanoTime(delegateOriginalDeadline)
+      }
+    }
   }
 
   @get:JvmName("source")
@@ -114,6 +178,36 @@ class Pipe(internal val maxBufferSize: Long) {
     }
 
     override fun timeout(): Timeout = timeout
+  }
+
+  /**
+   * Writes any buffered contents of this pipe to `sink`, then changes this pipe's sink to forward
+   * to `sink`. This pipe's source is closed and attempts to read it will throw
+   * [IllegalStateException].
+   *
+   * This method must not be called while concurrently accessing this pipe's sink. It is safe,
+   * however, to call this while concurrently writing this pipe's source.
+   */
+  @Throws(IOException::class)
+  fun fold(sink: Sink) {
+    while (true) {
+      // Either the buffer is empty and we can swap and return. Or the buffer is non-empty and we
+      // must copy it to sink without holding any locks, then try it all again.
+      val sinkBuffer: Buffer = synchronized(buffer) {
+        if (buffer.exhausted()) {
+          sourceClosed = true
+          foldedSink = sink
+          return@fold
+        }
+
+        val sinkBuffer = Buffer()
+        sinkBuffer.write(buffer, buffer.size)
+        (buffer as Object).notifyAll() // Notify the sink that it can resume writing.
+        return@synchronized sinkBuffer
+      }
+
+      sink.write(sinkBuffer, sinkBuffer.size)
+    }
   }
 
   @JvmName("-deprecated_sink")
